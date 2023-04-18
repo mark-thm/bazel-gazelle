@@ -16,7 +16,7 @@ visibility("//")
 
 # These Go modules are imported as Bazel modules via bazel_dep, not as
 # go_repository.
-IGNORED_MODULE_PATHS = [
+_IGNORED_MODULE_PATHS = [
     "github.com/bazelbuild/bazel-gazelle",
     "github.com/bazelbuild/rules_go",
 ]
@@ -103,7 +103,7 @@ def _safe_append_directives(module, gazelle_overrides, directives):
     else:
         existing = []
     gazelle_overrides[module.path] = struct(
-        directives = existing + directives
+        directives = existing + directives,
     )
 
 def _get_directives(path, gazelle_overrides):
@@ -131,6 +131,24 @@ def _repo_name(importpath):
     candidate_name = "_".join(segments).replace("-", "_")
     return "".join([c.lower() if c.isalnum() else "_" for c in candidate_name.elems()])
 
+def _is_dev_dependency(module_ctx, tag):
+    if hasattr(tag, "_is_dev_dependency"):
+        # Synthetic tags generated from go_deps.from_file have this "hidden" attribute.
+        return tag._is_dev_dependency
+
+    # This function is available in Bazel 6.2.0 and later. This is the same version that has
+    # module_ctx.extension_metadata, so the return value of this function is not used if it is
+    # not available.
+    return module_ctx.is_dev_dependency(tag) if hasattr(module_ctx, "is_dev_dependency") else False
+
+def _extension_metadata(module_ctx, *, root_module_direct_deps, root_module_direct_dev_deps):
+    if not hasattr(module_ctx, "extension_metadata"):
+        return None
+    return module_ctx.extension_metadata(
+        root_module_direct_deps = root_module_direct_deps,
+        root_module_direct_dev_deps = root_module_direct_dev_deps,
+    )
+
 def _go_repository_config_impl(ctx):
     repos = []
     for name, importpath in sorted(ctx.attr.importpaths.items()):
@@ -157,12 +175,19 @@ def _noop(_):
 
 def _go_deps_impl(module_ctx):
     module_resolutions = {}
-    gazelle_overrides = {}
-    module_overrides = {}
-    root_versions = {}
-    root_fixups = []
     sums = {}
     replace_map = {}
+
+    gazelle_overrides = {}
+    module_overrides = {}
+
+    root_versions = {}
+    root_fixups = []
+    root_module_direct_deps = {}
+    root_module_direct_dev_deps = {}
+
+    if module_ctx.modules[0].name == "gazelle":
+        root_module_direct_deps["bazel_gazelle_go_repository_config"] = None
 
     outdated_direct_dep_printer = print
     for module in module_ctx.modules:
@@ -208,7 +233,11 @@ def _go_deps_impl(module_ctx):
         additional_module_tags = []
         for from_file_tag in module.tags.from_file:
             module_tags_from_go_mod, go_mod_replace_map = deps_from_go_mod(module_ctx, from_file_tag.go_mod)
-            additional_module_tags += module_tags_from_go_mod
+            is_dev_dependency = _is_dev_dependency(module_ctx, from_file_tag)
+            additional_module_tags += [
+                with_replaced_or_new_fields(tag, _is_dev_dependency = is_dev_dependency)
+                for tag in module_tags_from_go_mod
+            ]
 
             if module.is_root:
                 replace_map.update(go_mod_replace_map)
@@ -241,7 +270,7 @@ def _go_deps_impl(module_ctx):
         for module_tag in module.tags.module + additional_module_tags:
             if module_tag.path in paths:
                 fail("Duplicate Go module path \"{}\" in module \"{}\".".format(module_tag.path, module.name))
-            if module_tag.path in IGNORED_MODULE_PATHS:
+            if module_tag.path in _IGNORED_MODULE_PATHS:
                 continue
             paths[module_tag.path] = None
             raw_version = _canonicalize_raw_version(module_tag.version)
@@ -253,9 +282,15 @@ def _go_deps_impl(module_ctx):
             # For modules imported from a go.sum, we know which ones are direct
             # dependencies and can thus only report implicit version upgrades
             # for direct dependencies. For manually specified go_deps.module
-            # tags, we always report version upgrades.
-            if module.is_root and getattr(module_tag, "direct", True):
+            # tags, we always report version upgrades unless users override with
+            # the "indirect" attribute.
+            if module.is_root and not module_tag.indirect:
                 root_versions[module_tag.path] = raw_version
+                if _is_dev_dependency(module_ctx, module_tag):
+                    root_module_direct_dev_deps[_repo_name(module_tag.path)] = None
+                else:
+                    root_module_direct_deps[_repo_name(module_tag.path)] = None
+
             version = semver.to_comparable(raw_version)
             if module_tag.path not in module_resolutions or version > module_resolutions[module_tag.path].version:
                 module_resolutions[module_tag.path] = struct(
@@ -279,7 +314,8 @@ def _go_deps_impl(module_ctx):
     for path, replace in replace_map.items():
         if path in module_resolutions:
             new_version = semver.to_comparable(replace.version)
-            module_resolutions[path] = with_replaced_or_new_fields(module_resolutions[path],
+            module_resolutions[path] = with_replaced_or_new_fields(
+                module_resolutions[path],
                 replace = replace.to_path,
                 version = new_version,
                 raw_version = replace.version,
@@ -352,6 +388,18 @@ build_naming_convention) or "gazelle:proto <value>" (for build_file_proto_mode) 
 to its 'directives' attribute.
 """ + format_module_file_fixup(root_fixups))
 
+    return _extension_metadata(
+        module_ctx,
+        root_module_direct_deps = root_module_direct_deps.keys(),
+        # If a Go module appears as both a dev and a non-dev dependency, it has to be imported as a
+        # non-dev dependency.
+        root_module_direct_dev_deps = {
+            repo_name: None
+            for repo_name in root_module_direct_dev_deps.keys()
+            if repo_name not in root_module_direct_deps
+        }.keys(),
+    )
+
 def _get_sum_from_module(path, module, sums):
     entry = (path, module.raw_version)
     if hasattr(module, "replace"):
@@ -422,6 +470,10 @@ _module_tag = tag_class(
                 "legacy",
                 "package",
             ],
+        ),
+        "indirect": attr.bool(
+            doc = """Whether this Go module is an indirect dependency.""",
+            default = False,
         ),
     },
 )
